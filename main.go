@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/sethvargo/go-envconfig"
 	"golang.org/x/exp/constraints"
 	"golang.org/x/sync/errgroup"
@@ -39,20 +40,20 @@ type pending struct {
 
 type connState struct {
 	mu      sync.Mutex
-	pending map[int32]pending
+	pending *lru.Cache[int32, pending]
 }
 
 func (s *connState) put(corrID int32, p pending) {
 	s.mu.Lock()
-	s.pending[corrID] = p
+	s.pending.Add(corrID, p)
 	s.mu.Unlock()
 }
 
 func (s *connState) take(corrID int32) (pending, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, ok := s.pending[corrID]
-	delete(s.pending, corrID)
+	p, ok := s.pending.Get(corrID)
+	s.pending.Remove(corrID)
 	return p, ok
 }
 
@@ -177,7 +178,11 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 
 	log.Printf("%s authenticated, switching to transparent proxy", client.RemoteAddr())
 
-	st := &connState{pending: make(map[int32]pending)}
+	cache, err := lru.New[int32, pending](64)
+	if err != nil {
+		return err
+	}
+	st := &connState{pending: cache}
 	wg, gCtx := errgroup.WithContext(ctx)
 	wg.Go(func() error {
 		return errors.Join(requests(gCtx, client, upstream, st), upstream.Close())
@@ -279,10 +284,9 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 // checkPlainAuth parses RFC 4616 PLAIN auth bytes ("[authzid]\0authcid\0passwd")
 // and constant-time-compares against the configured credentials.
 func checkPlainAuth(actual []byte, username, password string) bool {
-	authzid := []byte{}
-	expected := append(append(append(append(authzid, byte(0)), []byte(username)...), byte(0)), []byte(password)...)
-
-	return subtle.ConstantTimeCompare(actual, expected) == 1
+	idx := bytes.IndexByte(actual, byte(0))
+	expected := []byte(username + "\x00" + password)
+	return subtle.ConstantTimeCompare(actual[idx+1:], expected) == 1
 }
 
 func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
@@ -728,7 +732,7 @@ type byteReader struct {
 
 func (t *byteReader) ReadByte() (byte, error) {
 	var b [1]byte
-	_, err := t.Reader.Read(b[:])
+	_, err := io.ReadFull(t.Reader, b[:])
 	return b[0], err
 }
 
