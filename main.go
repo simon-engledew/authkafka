@@ -91,8 +91,10 @@ var cfg = struct {
 	Listen        string `env:"LISTEN,overwrite"`
 	UpstreamAddr  string `env:"UPSTREAM,overwrite"`
 	AdvertiseAddr Addr   `env:"ADVERTISE,overwrite"`
-	Username      string `env:"USER,overwrite"`
-	Password      string `env:"PASS,overwrite"`
+	Auth          struct {
+		Username string `env:"USERNAME,overwrite"`
+		Password string `env:"PASSWORD,overwrite"`
+	} `env:", prefix=AUTH_"`
 }{}
 
 func main() {
@@ -102,8 +104,8 @@ func main() {
 	flag.StringVar(&cfg.Listen, "listen", ":9093", "address to listen on")
 	flag.StringVar(&cfg.UpstreamAddr, "upstream", "127.0.0.1:9092", "kafka broker to forward to")
 	flag.TextVar(&cfg.AdvertiseAddr, "advertise", Addr{Host: "127.0.0.1", Port: 9093}, "host:port to advertise to clients in Metadata responses")
-	flag.StringVar(&cfg.Username, "user", "", "required SASL/PLAIN username")
-	flag.StringVar(&cfg.Password, "pass", "", "required SASL/PLAIN password")
+	flag.StringVar(&cfg.Auth.Username, "auth-username", "", "required SASL/PLAIN username")
+	flag.StringVar(&cfg.Auth.Password, "auth-password", "", "required SASL/PLAIN password")
 	flag.Parse()
 
 	err := envconfig.Process(ctx, &cfg)
@@ -111,8 +113,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if cfg.Username == "" || cfg.Password == "" {
-		log.Fatal("both -username and -password are required")
+	if cfg.Auth.Username == "" || cfg.Auth.Password == "" {
+		log.Fatal("both -auth-username and -auth-password are required")
 	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -120,7 +122,7 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("listening on %s, forwarding to %s, advertising %s (SASL/PLAIN user=%q)",
-		cfg.Listen, cfg.UpstreamAddr, cfg.AdvertiseAddr, cfg.Username)
+		cfg.Listen, cfg.UpstreamAddr, cfg.AdvertiseAddr, cfg.Auth.Username)
 
 	wg, gCtx := errgroup.WithContext(ctx)
 	wg.Go(func() error {
@@ -255,7 +257,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			if err != nil {
 				return fmt.Errorf("parse SaslAuthenticate: %w", err)
 			}
-			ok := checkPlainAuth(authBytes, cfg.Username, cfg.Password)
+			ok := checkPlainAuth(authBytes, cfg.Auth.Username, cfg.Auth.Password)
 			code := errNoError
 			msg := ""
 			if !ok {
@@ -267,9 +269,9 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 				return fmt.Errorf("write SaslAuthenticate response: %w", err)
 			}
 			if !ok {
-				return fmt.Errorf("authentication failed for user %q", cfg.Username)
+				return fmt.Errorf("authentication failed for user %q", cfg.Auth.Username)
 			}
-			log.Printf("auth succeeded for user %q", cfg.Username)
+			log.Printf("auth succeeded for user %q", cfg.Auth.Username)
 			return nil
 
 		default:
