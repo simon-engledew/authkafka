@@ -146,9 +146,7 @@ func main() {
 		}
 		wg.Go(func() error {
 			if err := handle(gCtx, client, cfg.UpstreamAddr); err != nil {
-				if !IsErrGoneAway(err) {
-					log.Print(err)
-				}
+				log.Print(err)
 			}
 			return nil
 		})
@@ -160,16 +158,26 @@ func main() {
 	}
 }
 
+func JoinErrors(errs ...error) error {
+	out := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if !IsErrGoneAway(err) {
+			out = append(out, err)
+		}
+	}
+	return errors.Join(out...)
+}
+
 func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err error) {
 	defer func() {
-		err = errors.Join(err, client.Close())
+		err = JoinErrors(err, client.Close())
 	}()
 	upstream, err := net.Dial("tcp", upstreamAddr)
 	if err != nil {
 		return fmt.Errorf("dial upstream: %w", err)
 	}
 	defer func() {
-		err = errors.Join(err, upstream.Close())
+		err = JoinErrors(err, upstream.Close())
 	}()
 
 	if err := authenticate(ctx, client, upstream); err != nil {
@@ -185,10 +193,14 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 	st := &connState{pending: cache}
 	wg, gCtx := errgroup.WithContext(ctx)
 	wg.Go(func() error {
-		return errors.Join(requests(gCtx, client, upstream, st), upstream.Close())
+		<-ctx.Done()
+		return JoinErrors(upstream.Close(), client.Close())
 	})
 	wg.Go(func() error {
-		return errors.Join(responses(gCtx, upstream, client, st), client.Close())
+		return JoinErrors(requests(gCtx, client, upstream, st), upstream.Close())
+	})
+	wg.Go(func() error {
+		return JoinErrors(responses(gCtx, upstream, client, st), client.Close())
 	})
 	return wg.Wait()
 }
