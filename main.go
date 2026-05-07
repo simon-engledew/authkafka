@@ -707,10 +707,12 @@ func readN[T constraints.Integer](r io.Reader, size T) ([]byte, error) {
 }
 
 func writePacket(c net.Conn, payload []byte) error {
-	out := make([]byte, 4+len(payload))
-	binary.BigEndian.PutUint32(out[:4], uint32(len(payload)))
-	copy(out[4:], payload)
-	_, err := c.Write(out)
+	var prefix [4]byte
+	binary.BigEndian.PutUint32(prefix[:], uint32(len(payload)))
+	if _, err := c.Write(prefix[:]); err != nil {
+		return err
+	}
+	_, err := c.Write(payload)
 	return err
 }
 
