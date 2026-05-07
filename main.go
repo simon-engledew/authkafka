@@ -97,6 +97,10 @@ var cfg = struct {
 	} `env:", prefix=AUTH_"`
 }{}
 
+func IsErrGoneAway(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
+}
+
 func main() {
 	ctx, cancelFunc := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancelFunc()
@@ -133,7 +137,7 @@ func main() {
 	for ctx.Err() == nil {
 		client, err := ln.Accept()
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			if IsErrGoneAway(err) {
 				break
 			}
 			log.Printf("accept: %v", err)
@@ -141,10 +145,9 @@ func main() {
 		}
 		wg.Go(func() error {
 			if err := handle(gCtx, client, cfg.UpstreamAddr); err != nil {
-				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				if !IsErrGoneAway(err) {
 					log.Print(err)
 				}
-				return err
 			}
 			return nil
 		})
@@ -175,24 +178,22 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 	defer cancel()
 	go func() {
 		<-ctx.Done()
-		err = errors.Join(err, client.Close())
-		err = errors.Join(err, upstream.Close())
+		err = errors.Join(err, client.Close(), upstream.Close())
 	}()
 
 	if err := authenticate(ctx, client, upstream); err != nil {
-		log.Printf("auth: %v", err)
 		return err
 	}
 
 	log.Printf("%s authenticated, switching to transparent proxy", client.RemoteAddr())
 
 	st := &connState{pending: make(map[int32]pending)}
-	wg, ctx := errgroup.WithContext(ctx)
+	wg, gCtx := errgroup.WithContext(ctx)
 	wg.Go(func() error {
-		return requests(ctx, client, upstream, st)
+		return requests(gCtx, client, upstream, st)
 	})
 	wg.Go(func() error {
-		return responses(ctx, upstream, client, st)
+		return responses(gCtx, upstream, client, st)
 	})
 	return wg.Wait()
 }
