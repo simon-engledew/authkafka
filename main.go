@@ -160,15 +160,12 @@ func main() {
 }
 
 func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err error) {
-	log.Printf("%s connected", client.RemoteAddr())
-
 	defer func() {
 		err = errors.Join(err, client.Close())
 	}()
 	upstream, err := net.Dial("tcp", upstreamAddr)
 	if err != nil {
-		log.Printf("dial upstream: %v", err)
-		return err
+		return fmt.Errorf("dial upstream: %w", err)
 	}
 	defer func() {
 		err = errors.Join(err, upstream.Close())
@@ -176,10 +173,6 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go func() {
-		<-ctx.Done()
-		err = errors.Join(err, client.Close(), upstream.Close())
-	}()
 
 	if err := authenticate(ctx, client, upstream); err != nil {
 		return err
@@ -189,6 +182,10 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 
 	st := &connState{pending: make(map[int32]pending)}
 	wg, gCtx := errgroup.WithContext(ctx)
+	go func() {
+		<-gCtx.Done()
+		err = errors.Join(client.Close(), upstream.Close())
+	}()
 	wg.Go(func() error {
 		return requests(gCtx, client, upstream, st)
 	})
@@ -299,10 +296,7 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 	for ctx.Err() == nil {
 		payload, err := readPacket(src)
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				return err
-			}
-			return nil
+			return err
 		}
 
 		if len(payload) >= 8 {
@@ -331,10 +325,7 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 	for ctx.Err() == nil {
 		payload, err := readPacket(src)
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				return err
-			}
-			return nil
+			return err
 		}
 
 		if len(payload) >= 4 {
