@@ -171,9 +171,6 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 		err = errors.Join(err, upstream.Close())
 	}()
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	if err := authenticate(ctx, client, upstream); err != nil {
 		return err
 	}
@@ -182,15 +179,11 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 
 	st := &connState{pending: make(map[int32]pending)}
 	wg, gCtx := errgroup.WithContext(ctx)
-	go func() {
-		<-gCtx.Done()
-		err = errors.Join(client.Close(), upstream.Close())
-	}()
 	wg.Go(func() error {
-		return requests(gCtx, client, upstream, st)
+		return errors.Join(requests(gCtx, client, upstream, st), upstream.Close())
 	})
 	wg.Go(func() error {
-		return responses(gCtx, upstream, client, st)
+		return errors.Join(responses(gCtx, upstream, client, st), client.Close())
 	})
 	return wg.Wait()
 }
