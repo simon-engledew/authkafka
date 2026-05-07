@@ -61,7 +61,11 @@ type Addr struct {
 	Port int32
 }
 
-func (a Addr) UnmarshalText(text []byte) error {
+func (a Addr) MarshalText() (text []byte, err error) {
+	return []byte(fmt.Sprintf("%s:%d", a.Host, a.Port)), nil
+}
+
+func (a *Addr) UnmarshalText(text []byte) error {
 	return a.Set(string(text))
 }
 
@@ -84,11 +88,11 @@ func (a *Addr) Set(s string) error {
 }
 
 var cfg = struct {
-	Listen        string `env:"LISTEN"`
-	UpstreamAddr  string `env:"UPSTREAM"`
-	AdvertiseAddr Addr   `env:"ADVERTISE_ADDR,default=127.0.0.1:9093"`
-	Username      string `env:"AUTH_USERNAME"`
-	Password      string `env:"AUTH_PASSWORD"`
+	Listen        string `env:"LISTEN,overwrite"`
+	UpstreamAddr  string `env:"UPSTREAM,overwrite"`
+	AdvertiseAddr Addr   `env:"ADVERTISE,overwrite"`
+	Username      string `env:"USER,overwrite"`
+	Password      string `env:"PASS,overwrite"`
 }{}
 
 func main() {
@@ -97,9 +101,9 @@ func main() {
 
 	flag.StringVar(&cfg.Listen, "listen", ":9093", "address to listen on")
 	flag.StringVar(&cfg.UpstreamAddr, "upstream", "127.0.0.1:9092", "kafka broker to forward to")
-	flag.Var(&cfg.AdvertiseAddr, "advertise", "host:port to advertise to clients in Metadata responses")
-	flag.StringVar(&cfg.Username, "username", "", "required SASL/PLAIN username")
-	flag.StringVar(&cfg.Password, "password", "", "required SASL/PLAIN password")
+	flag.TextVar(&cfg.AdvertiseAddr, "advertise", Addr{Host: "127.0.0.1", Port: 9093}, "host:port to advertise to clients in Metadata responses")
+	flag.StringVar(&cfg.Username, "user", "", "required SASL/PLAIN username")
+	flag.StringVar(&cfg.Password, "pass", "", "required SASL/PLAIN password")
 	flag.Parse()
 
 	err := envconfig.Process(ctx, &cfg)
