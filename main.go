@@ -157,13 +157,15 @@ func main() {
 }
 
 func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err error) {
+	log.Printf("%s connected", client.RemoteAddr())
+
 	defer func() {
 		err = errors.Join(err, client.Close())
 	}()
 	upstream, err := net.Dial("tcp", upstreamAddr)
 	if err != nil {
 		log.Printf("dial upstream: %v", err)
-		return
+		return err
 	}
 	defer func() {
 		err = errors.Join(err, upstream.Close())
@@ -181,7 +183,8 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 		log.Printf("auth: %v", err)
 		return err
 	}
-	log.Printf("authenticated, switching to transparent proxy")
+
+	log.Printf("%s authenticated, switching to transparent proxy", client.RemoteAddr())
 
 	st := &connState{pending: make(map[int32]pending)}
 	wg, ctx := errgroup.WithContext(ctx)
@@ -279,7 +282,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 // checkPlainAuth parses RFC 4616 PLAIN auth bytes ("[authzid]\0authcid\0passwd")
@@ -320,7 +323,7 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
@@ -355,7 +358,7 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 type apiVersionEntry struct {
