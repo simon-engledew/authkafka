@@ -413,7 +413,7 @@ func rewriteApiVersionsResponse(payload []byte, apiVersion int16, inject []apiVe
 		}
 		var tagBuf bytes.Buffer
 		if flexibleBody {
-			if err := copyTaggedFields(r, &tagBuf); err != nil {
+			if err := readTaggedFields(&byteReader{io.TeeReader(r, &tagBuf)}); err != nil {
 				return nil, fmt.Errorf("entry[%d] tags: %w", i, err)
 			}
 		}
@@ -466,7 +466,7 @@ func rewriteMetadataResponse(payload []byte, apiVersion int16, addr Addr) ([]byt
 		return nil, fmt.Errorf("corr_id: %w", err)
 	}
 	if flexible {
-		if err := copyTaggedFields(r, &out); err != nil {
+		if err := readTaggedFields(&byteReader{io.TeeReader(r, &out)}); err != nil {
 			return nil, fmt.Errorf("header tags: %w", err)
 		}
 	}
@@ -559,7 +559,7 @@ func rewriteMetadataResponse(payload []byte, apiVersion int16, addr Addr) ([]byt
 			}
 		}
 		if flexible {
-			if err := copyTaggedFields(r, &out); err != nil {
+			if err := readTaggedFields(&byteReader{io.TeeReader(r, &out)}); err != nil {
 				return nil, fmt.Errorf("broker[%d] tags: %w", i, err)
 			}
 		}
@@ -600,7 +600,7 @@ func parseSaslAuthenticateRequest(payload []byte, apiVersion int16) ([]byte, err
 		return nil, err
 	}
 	if flexible {
-		if err := copyTaggedFields(r, io.Discard); err != nil {
+		if err := readTaggedFields(r); err != nil {
 			return nil, err
 		}
 	}
@@ -720,24 +720,34 @@ func writeUvarint(out io.Writer, v uint64) (int, error) {
 	return out.Write(buf[:n])
 }
 
-func copyTaggedFields(r *bytes.Reader, out io.Writer) error {
+type byteReader struct {
+	io.Reader
+}
+
+func (t *byteReader) ReadByte() (byte, error) {
+	var b [1]byte
+	_, err := t.Reader.Read(b[:])
+	return b[0], err
+}
+
+func readTaggedFields(r interface {
+	io.Reader
+	io.ByteReader
+}) error {
 	count, err := binary.ReadUvarint(r)
 	if err != nil {
 		return err
 	}
-	_, _ = writeUvarint(out, count)
 	for i := uint64(0); i < count; i++ {
-		tag, err := binary.ReadUvarint(r)
+		_, err := binary.ReadUvarint(r)
 		if err != nil {
 			return err
 		}
-		_, _ = writeUvarint(out, tag)
 		sz, err := binary.ReadUvarint(r)
 		if err != nil {
 			return err
 		}
-		_, _ = writeUvarint(out, sz)
-		if _, err := io.CopyN(out, r, int64(sz)); err != nil {
+		if _, err := io.ReadAll(io.LimitReader(r, int64(sz))); err != nil {
 			return err
 		}
 	}
