@@ -113,8 +113,7 @@ func main() {
 	flag.StringVar(&cfg.Auth.Password, "auth-password", "", "required SASL/PLAIN password")
 	flag.Parse()
 
-	err := envconfig.Process(ctx, &cfg)
-	if err != nil {
+	if err := envconfig.Process(ctx, &cfg); err != nil {
 		log.Fatal(err)
 	}
 
@@ -122,30 +121,30 @@ func main() {
 		log.Fatal("both -auth-username and -auth-password are required")
 	}
 
-	ln, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
+	if err := listen(ctx); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func listen(ctx context.Context) error {
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return err
+	}
+	stop := context.AfterFunc(ctx, func() { err = errors.Join(ln.Close()) })
+	defer stop()
+
 	log.Printf("listening on %s, forwarding to %s, advertising %s (SASL/PLAIN user=%q)",
 		cfg.Listen, cfg.UpstreamAddr, cfg.AdvertiseAddr, cfg.Auth.Username)
 
 	wg, gCtx := errgroup.WithContext(ctx)
-	wg.Go(func() error {
-		<-ctx.Done()
-		return ln.Close()
-	})
-
 	for ctx.Err() == nil {
 		client, err := ln.Accept()
 		if err != nil {
-			if IsErrGoneAway(err) {
-				break
-			}
-			log.Printf("accept: %v", err)
-			continue
+			return err
 		}
 		wg.Go(func() error {
-			if err := handle(gCtx, client, cfg.UpstreamAddr); err != nil {
+			if err := handle(gCtx, client, cfg.UpstreamAddr); err != nil && !IsErrGoneAway(err) {
 				log.Print(err)
 			}
 			return nil
@@ -153,32 +152,25 @@ func main() {
 	}
 
 	fmt.Println("waiting for shutdown")
-	if err := wg.Wait(); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func JoinErrors(errs ...error) error {
-	out := make([]error, 0, len(errs))
-	for _, err := range errs {
-		if !IsErrGoneAway(err) {
-			out = append(out, err)
-		}
-	}
-	return errors.Join(out...)
+	return wg.Wait()
 }
 
 func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err error) {
-	defer func() {
-		err = JoinErrors(err, client.Close())
-	}()
-	upstream, err := net.Dial("tcp", upstreamAddr)
+	stopClient := context.AfterFunc(ctx, func() {
+		err = errors.Join(err, client.Close())
+	})
+	defer stopClient()
+
+	var d net.Dialer
+	upstream, err := d.DialContext(ctx, "tcp", upstreamAddr)
 	if err != nil {
 		return fmt.Errorf("dial upstream: %w", err)
 	}
-	defer func() {
-		err = JoinErrors(err, upstream.Close())
-	}()
+
+	stopUpstream := context.AfterFunc(ctx, func() {
+		err = errors.Join(err, upstream.Close())
+	})
+	defer stopUpstream()
 
 	if err := authenticate(ctx, client, upstream); err != nil {
 		return err
@@ -190,17 +182,14 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 	if err != nil {
 		return err
 	}
+
 	st := &connState{pending: cache}
 	wg, gCtx := errgroup.WithContext(ctx)
 	wg.Go(func() error {
-		<-ctx.Done()
-		return JoinErrors(upstream.Close(), client.Close())
+		return errors.Join(requests(gCtx, client, upstream, st), upstream.Close())
 	})
 	wg.Go(func() error {
-		return JoinErrors(requests(gCtx, client, upstream, st), upstream.Close())
-	})
-	wg.Go(func() error {
-		return JoinErrors(responses(gCtx, upstream, client, st), client.Close())
+		return errors.Join(responses(gCtx, upstream, client, st), client.Close())
 	})
 	return wg.Wait()
 }
@@ -235,13 +224,11 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			// Inject them so the client believes the (proxy) broker supports SASL/PLAIN.
 			rewritten, rerr := rewriteApiVersionsResponse(resp, apiVersion, saslApiVersions)
 			if rerr != nil {
-				log.Printf("auth ApiVersions rewrite failed: %v (forwarding unchanged)", rerr)
-			} else {
-				log.Printf("auth ApiVersions rewritten %d -> %d bytes (injected SaslHandshake, SaslAuthenticate)",
-					len(resp), len(rewritten))
-				resp = rewritten
+				return rerr
 			}
-			if err := writePacket(client, resp); err != nil {
+			log.Printf("auth ApiVersions rewritten %d -> %d bytes (injected SaslHandshake, SaslAuthenticate)",
+				len(resp), len(rewritten))
+			if err := writePacket(client, rewritten); err != nil {
 				return fmt.Errorf("write ApiVersions response: %w", err)
 			}
 
