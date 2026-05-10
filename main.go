@@ -18,7 +18,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/sethvargo/go-envconfig"
-	"golang.org/x/exp/constraints"
+	"github.com/simon-engledew/kafkaproto"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -28,7 +28,6 @@ const (
 	apiKeyApiVersions      = 18
 	apiKeySaslAuthenticate = 36
 
-	errNoError                  int16 = 0
 	errUnsupportedSaslMechanism int16 = 33
 	errSaslAuthenticationFailed int16 = 58
 )
@@ -59,7 +58,7 @@ var allowedApiKeys = map[int16]struct{}{
 
 type pending struct {
 	apiKey, apiVersion int16
-	clientID           string
+	clientID           *string
 }
 
 type connState struct {
@@ -175,7 +174,7 @@ func listen(ctx context.Context) error {
 		})
 	}
 
-	fmt.Println("waiting for shutdown")
+	log.Print("shutting down...")
 	return wg.Wait()
 }
 
@@ -218,6 +217,23 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 	return wg.Wait()
 }
 
+func ReadHeader(r *kafkaproto.Reader) (apiKey int16, apiVersion int16, corrID int32, clientID *string, err error) {
+	apiKey, err = r.ReadInt16()
+	if err != nil {
+		return
+	}
+	apiVersion, err = r.ReadInt16()
+	if err != nil {
+		return
+	}
+	corrID, err = r.ReadInt32()
+	if err != nil {
+		return
+	}
+	clientID, err = r.ReadNullableString()
+	return
+}
+
 // authenticate runs the pre-SASL state machine. We only forward ApiVersions
 // (so the broker can advertise versions); SaslHandshake and SaslAuthenticate
 // are answered locally and the credentials are checked here. Anything else
@@ -231,71 +247,132 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 		if len(payload) < 8 {
 			return errors.New("short request header")
 		}
-		apiKey := int16(binary.BigEndian.Uint16(payload[0:2]))
-		apiVersion := int16(binary.BigEndian.Uint16(payload[2:4]))
-		corrID := int32(binary.BigEndian.Uint32(payload[4:8]))
+
+		r := kafkaproto.NewReader(payload)
+		apiKey, apiVersion, corrID, clientID, err := ReadHeader(r)
+		if err != nil {
+			return err
+		}
+
+		_ = clientID
 
 		switch apiKey {
 		case apiKeyApiVersions:
 			if err := writePacket(ctx, upstream, payload); err != nil {
-				return fmt.Errorf("forward ApiVersions: %w", err)
+				return err
 			}
+
 			resp, err := readPacket(ctx, upstream)
 			if err != nil {
-				return fmt.Errorf("read ApiVersions response: %w", err)
+				return err
 			}
-			// Brokers on non-SASL listeners don't advertise SaslHandshake/SaslAuthenticate.
-			// Inject them so the client believes the (proxy) broker supports SASL/PLAIN.
-			rewritten, rerr := rewriteApiVersionsResponse(resp, apiVersion, saslApiVersions)
-			if rerr != nil {
-				return rerr
+
+			r := kafkaproto.NewReader(resp)
+
+			respID, err := r.ReadInt32()
+			if err != nil {
+				return err
 			}
-			log.Printf("auth ApiVersions rewritten %d -> %d bytes (injected SaslHandshake, SaslAuthenticate)",
-				len(resp), len(rewritten))
-			if err := writePacket(ctx, client, rewritten); err != nil {
+			if corrID != respID {
+				return errors.New("incorrect response ID")
+			}
+
+			var msg kafkaproto.ApiVersionsResponse
+			if err := msg.Decode(r, apiVersion); err != nil {
+				return err
+			}
+
+			apiKeys := make([]kafkaproto.ApiVersionsResponseApiVersion, 0, len(allowedApiKeys))
+
+			for _, k := range msg.ApiKeys {
+				if k.ApiKey == apiKeySaslAuthenticate || k.ApiKey == apiKeySaslHandshake {
+					continue
+				}
+				if _, ok := allowedApiKeys[k.ApiKey]; ok {
+					apiKeys = append(apiKeys, k)
+				}
+			}
+
+			apiKeys = append(apiKeys,
+				kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslHandshake, MinVersion: 1, MaxVersion: 1},
+				kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslAuthenticate, MinVersion: 0, MaxVersion: 2},
+			)
+
+			msg.ApiKeys = apiKeys
+
+			w := kafkaproto.NewWriter()
+			w.WriteInt32(respID)
+			if err := msg.Encode(w, apiVersion); err != nil {
+				return err
+			}
+			if err := writePacket(ctx, client, w.Bytes()); err != nil {
 				return fmt.Errorf("write ApiVersions response: %w", err)
 			}
 
 		case apiKeySaslHandshake:
-			mechanism, err := parseSaslHandshakeRequest(payload)
-			if err != nil {
-				return fmt.Errorf("parse SaslHandshake: %w", err)
+			var req kafkaproto.SaslHandshakeRequest
+			if err := req.Decode(r, apiVersion); err != nil {
+				return err
 			}
-			log.Printf("auth SaslHandshake mechanism=%q", mechanism)
-			code := errNoError
-			if mechanism != "PLAIN" {
-				code = errUnsupportedSaslMechanism
+			var resp kafkaproto.SaslHandshakeResponse
+
+			if req.Mechanism != "PLAIN" {
+				resp.ErrorCode = errUnsupportedSaslMechanism
 			}
-			resp := buildSaslHandshakeResponse(corrID, code, []string{"PLAIN"})
-			if err := writePacket(ctx, client, resp); err != nil {
-				return fmt.Errorf("write SaslHandshake response: %w", err)
+
+			w := kafkaproto.NewWriter()
+			w.WriteInt32(corrID)
+			if err := resp.Encode(w, apiVersion); err != nil {
+				return err
 			}
-			if code != errNoError {
-				return fmt.Errorf("client requested unsupported mechanism %q", mechanism)
+
+			if err := writePacket(ctx, client, w.Bytes()); err != nil {
+				return err
+			}
+
+			if resp.ErrorCode != 0 {
+				return fmt.Errorf("client requested unsupported mechanism %q", req.Mechanism)
 			}
 
 		case apiKeySaslAuthenticate:
-			authBytes, err := parseSaslAuthenticateRequest(payload, apiVersion)
-			if err != nil {
-				return fmt.Errorf("parse SaslAuthenticate: %w", err)
+			var req kafkaproto.SaslAuthenticateRequest
+
+			if apiVersion >= 2 {
+				if _, err := r.ReadUvarint(); err != nil {
+					return err
+				}
 			}
-			ok := checkPlainAuth(authBytes, cfg.Auth.Username, cfg.Auth.Password)
-			code := errNoError
-			msg := ""
+
+			if err := req.Decode(r, apiVersion); err != nil {
+				return err
+			}
+			var resp kafkaproto.SaslAuthenticateResponse
+
+			ok := checkPlainAuth(req.AuthBytes, cfg.Auth.Username, cfg.Auth.Password)
+
+			w := kafkaproto.NewWriter()
+			w.WriteInt32(corrID)
+			if apiVersion >= 2 {
+				w.WriteUvarint(0)
+			}
+
 			if !ok {
-				code = errSaslAuthenticationFailed
-				msg = "Authentication failed"
+				resp.ErrorCode = errSaslAuthenticationFailed
+				resp.ErrorMessage = new("Authentication failed")
 			}
-			resp := buildSaslAuthenticateResponse(corrID, apiVersion, code, msg)
-			if err := writePacket(ctx, client, resp); err != nil {
-				return fmt.Errorf("write SaslAuthenticate response: %w", err)
+
+			if err := resp.Encode(w, apiVersion); err != nil {
+				return err
 			}
+			if err := writePacket(ctx, client, w.Bytes()); err != nil {
+				return err
+			}
+
 			if !ok {
 				return fmt.Errorf("authentication failed for user %q", cfg.Auth.Username)
 			}
 			log.Printf("auth succeeded for user %q", cfg.Auth.Username)
 			return nil
-
 		default:
 			return fmt.Errorf("access denied for %d", apiKey)
 		}
@@ -320,15 +397,10 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 		}
 
 		if len(payload) >= 8 {
-			apiKey := int16(binary.BigEndian.Uint16(payload[0:2]))
-			apiVersion := int16(binary.BigEndian.Uint16(payload[2:4]))
-			corrID := int32(binary.BigEndian.Uint32(payload[4:8]))
-			var clientID string
-			if len(payload) >= 10 {
-				clen := int16(binary.BigEndian.Uint16(payload[8:10]))
-				if clen > 0 && 10+int(clen) <= len(payload) {
-					clientID = string(payload[10 : 10+clen])
-				}
+			r := kafkaproto.NewReader(payload)
+			apiKey, apiVersion, corrID, clientID, err := ReadHeader(r)
+			if err != nil {
+				return err
 			}
 
 			if _, allowed := allowedApiKeys[apiKey]; !allowed {
@@ -354,15 +426,45 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 		}
 
 		if len(payload) >= 4 {
-			corrID := int32(binary.BigEndian.Uint32(payload[0:4]))
+			r := kafkaproto.NewReader(payload)
+			corrID, err := r.ReadInt32()
+			if err != nil {
+				return err
+			}
+
 			if p, ok := st.take(corrID); ok {
 				if p.apiKey == apiKeyMetadata {
-					rewritten, err := rewriteMetadataResponse(payload, p.apiVersion, cfg.AdvertiseAddr)
-					if err != nil {
+					if p.apiVersion >= 9 {
+						if _, err := r.ReadUvarint(); err != nil {
+							return err
+						}
+					}
+
+					var resp kafkaproto.MetadataResponse
+
+					if err := resp.Decode(r, p.apiVersion); err != nil {
 						return err
 					}
 
-					if err := writePacket(ctx, dst, rewritten); err != nil {
+					resp.Brokers = resp.Brokers[:1]
+
+					for i := range resp.Brokers {
+						resp.Brokers[i].Host = cfg.AdvertiseAddr.Host
+						resp.Brokers[i].Port = cfg.AdvertiseAddr.Port
+					}
+
+					w := kafkaproto.NewWriter()
+					w.WriteInt32(corrID)
+
+					if p.apiVersion >= 9 {
+						w.WriteUvarint(0)
+					}
+
+					if err := resp.Encode(w, p.apiVersion); err != nil {
+						return err
+					}
+
+					if err := writePacket(ctx, dst, w.Bytes()); err != nil {
 						return err
 					}
 
@@ -379,425 +481,35 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 	return ctx.Err()
 }
 
-type apiVersionEntry struct {
-	apiKey, minVersion, maxVersion int16
-}
-
-// saslApiVersions are the (key, min, max) ranges we advertise locally because we
-// terminate SASL ourselves. Range maxes match the versions our parsers/builders
-// implement; clients pick the highest mutually supported version.
-var saslApiVersions = []apiVersionEntry{
-	{apiKey: apiKeySaslHandshake, minVersion: 1, maxVersion: 1},
-	{apiKey: apiKeySaslAuthenticate, minVersion: 0, maxVersion: 2},
-}
-
-// rewriteApiVersionsResponse injects (or replaces) entries in the api_keys array of
-// an ApiVersionsResponse. Note: ApiVersions uses a non-flexible response header at
-// every version — only the body becomes flexible at v3+.
-func rewriteApiVersionsResponse(payload []byte, apiVersion int16, inject []apiVersionEntry) ([]byte, error) {
-	flexibleBody := apiVersion >= 3
-	r := bytes.NewReader(payload)
-
-	var out bytes.Buffer
-
-	if _, err := io.CopyN(&out, r, 4); err != nil { // correlation_id
-		return nil, fmt.Errorf("corr_id: %w", err)
-	}
-	if _, err := io.CopyN(&out, r, 2); err != nil { // error_code
-		return nil, fmt.Errorf("error_code: %w", err)
-	}
-
-	var existingCount int
-	if flexibleBody {
-		n, err := binary.ReadUvarint(r)
-		if err != nil {
-			return nil, fmt.Errorf("api_keys count: %w", err)
-		}
-		if n > 0 {
-			existingCount = int(n) - 1
-		}
-	} else {
-		var n int32
-		if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-			return nil, fmt.Errorf("api_keys count: %w", err)
-		}
-		if n > 0 {
-			existingCount = int(n)
-		}
-	}
-
-	dropKey := make(map[int16]struct{}, len(inject))
-	for _, e := range inject {
-		dropKey[e.apiKey] = struct{}{}
-	}
-
-	var entriesBuf bytes.Buffer
-	keptCount := 0
-	for i := 0; i < existingCount; i++ {
-		var ak, minV, maxV int16
-		if err := binary.Read(r, binary.BigEndian, &ak); err != nil {
-			return nil, fmt.Errorf("entry[%d] api_key: %w", i, err)
-		}
-		if err := binary.Read(r, binary.BigEndian, &minV); err != nil {
-			return nil, fmt.Errorf("entry[%d] min: %w", i, err)
-		}
-		if err := binary.Read(r, binary.BigEndian, &maxV); err != nil {
-			return nil, fmt.Errorf("entry[%d] max: %w", i, err)
-		}
-		var tagBuf bytes.Buffer
-		if flexibleBody {
-			if err := readTaggedFields(&byteReader{io.TeeReader(r, &tagBuf)}); err != nil {
-				return nil, fmt.Errorf("entry[%d] tags: %w", i, err)
-			}
-		}
-		if _, drop := dropKey[ak]; drop {
-			continue
-		}
-		if _, allowed := allowedApiKeys[ak]; !allowed {
-			continue
-		}
-		keptCount++
-		_ = binary.Write(&entriesBuf, binary.BigEndian, ak)
-		_ = binary.Write(&entriesBuf, binary.BigEndian, minV)
-		_ = binary.Write(&entriesBuf, binary.BigEndian, maxV)
-		if flexibleBody {
-			if _, err := tagBuf.WriteTo(&entriesBuf); err != nil {
-				return nil, fmt.Errorf("write[%d] tags: %w", i, err)
-			}
-		}
-	}
-
-	for _, e := range inject {
-		_ = binary.Write(&entriesBuf, binary.BigEndian, e.apiKey)
-		_ = binary.Write(&entriesBuf, binary.BigEndian, e.minVersion)
-		_ = binary.Write(&entriesBuf, binary.BigEndian, e.maxVersion)
-		if flexibleBody {
-			entriesBuf.WriteByte(0) // empty per-entry tag_buffer
-		}
-	}
-
-	newCount := keptCount + len(inject)
-	if flexibleBody {
-		_, _ = writeUvarint(&out, uint64(newCount+1))
-	} else {
-		_ = binary.Write(&out, binary.BigEndian, int32(newCount))
-	}
-	out.Write(entriesBuf.Bytes())
-
-	// throttle_time_ms (v1+) and the response-level tag_buffer (v3+) follow the
-	// array; copy whatever's left through verbatim.
-	_, err := io.Copy(&out, r)
-	return out.Bytes(), err
-}
-
-// rewriteMetadataResponse parses the brokers array out of a Metadata response and
-// replaces every (host, port) pair with the proxy's advertised address. The rest
-// of the payload (controller_id, topics, ...) is copied through verbatim.
-func rewriteMetadataResponse(payload []byte, apiVersion int16, addr Addr) ([]byte, error) {
-	flexible := apiVersion >= 9
-	r := bytes.NewReader(payload)
-	var out bytes.Buffer
-
-	if _, err := io.CopyN(&out, r, 4); err != nil {
-		return nil, fmt.Errorf("corr_id: %w", err)
-	}
-	if flexible {
-		if err := readTaggedFields(&byteReader{io.TeeReader(r, &out)}); err != nil {
-			return nil, fmt.Errorf("header tags: %w", err)
-		}
-	}
-	if apiVersion >= 3 {
-		if _, err := io.CopyN(&out, r, 4); err != nil {
-			return nil, fmt.Errorf("throttle: %w", err)
-		}
-	}
-
-	var brokerCount int
-	if flexible {
-		n, err := binary.ReadUvarint(r)
-		if err != nil {
-			return nil, fmt.Errorf("brokers count: %w", err)
-		}
-		_, _ = writeUvarint(&out, n)
-		if n > 0 {
-			brokerCount = int(n) - 1
-		}
-	} else {
-		var n int32
-		if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-			return nil, fmt.Errorf("brokers count: %w", err)
-		}
-		_ = binary.Write(&out, binary.BigEndian, n)
-		if n > 0 {
-			brokerCount = int(n)
-		}
-	}
-
-	for i := 0; i < brokerCount; i++ {
-		if _, err := io.CopyN(&out, r, 4); err != nil {
-			return nil, fmt.Errorf("broker[%d] node_id: %w", i, err)
-		}
-		if flexible {
-			n, err := binary.ReadUvarint(r)
-			if err != nil {
-				return nil, fmt.Errorf("broker[%d] host len: %w", i, err)
-			}
-			if n == 0 {
-				return nil, fmt.Errorf("broker[%d] null host", i)
-			}
-			if _, err := r.Seek(int64(n-1), io.SeekCurrent); err != nil {
-				return nil, fmt.Errorf("broker[%d] host body: %w", i, err)
-			}
-			_, _ = writeUvarint(&out, uint64(len(addr.Host)+1))
-			out.WriteString(addr.Host)
-		} else {
-			var n int16
-			if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-				return nil, fmt.Errorf("broker[%d] host len: %w", i, err)
-			}
-			if n < 0 {
-				return nil, fmt.Errorf("broker[%d] null host", i)
-			}
-			if _, err := r.Seek(int64(n), io.SeekCurrent); err != nil {
-				return nil, fmt.Errorf("broker[%d] host body: %w", i, err)
-			}
-			_ = binary.Write(&out, binary.BigEndian, int16(len(addr.Host)))
-			out.WriteString(addr.Host)
-		}
-		var n int32
-		if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-			return nil, fmt.Errorf("broker[%d] port: %w", i, err)
-		}
-		_ = binary.Write(&out, binary.BigEndian, addr.Port)
-		if apiVersion >= 1 {
-			if flexible {
-				n, err := binary.ReadUvarint(r)
-				if err != nil {
-					return nil, fmt.Errorf("broker[%d] rack len: %w", i, err)
-				}
-				_, _ = writeUvarint(&out, n)
-				if n > 1 {
-					if _, err := io.CopyN(&out, r, int64(n-1)); err != nil {
-						return nil, fmt.Errorf("broker[%d] rack body: %w", i, err)
-					}
-				}
-			} else {
-				var n int16
-				if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-					return nil, fmt.Errorf("broker[%d] rack len: %w", i, err)
-				}
-				_ = binary.Write(&out, binary.BigEndian, n)
-				if n > 0 {
-					if _, err := io.CopyN(&out, r, int64(n)); err != nil {
-						return nil, fmt.Errorf("broker[%d] rack body: %w", i, err)
-					}
-				}
-			}
-		}
-		if flexible {
-			if err := readTaggedFields(&byteReader{io.TeeReader(r, &out)}); err != nil {
-				return nil, fmt.Errorf("broker[%d] tags: %w", i, err)
-			}
-		}
-	}
-
-	_, err := io.Copy(&out, r)
-	return out.Bytes(), err
-}
-
-func parseSaslHandshakeRequest(payload []byte) (string, error) {
-	// SaslHandshake is non-flexible at all versions; request header v1.
-	r := bytes.NewReader(payload)
-	if _, err := r.Seek(8, io.SeekCurrent); err != nil {
-		return "", err
-	}
-	if err := skipNullableString(r); err != nil { // client_id
-		return "", err
-	}
-	var mlen int16
-	if err := binary.Read(r, binary.BigEndian, &mlen); err != nil {
-		return "", err
-	}
-	if mlen < 0 {
-		return "", errors.New("null mechanism")
-	}
-	out, err := readN(r, mlen)
-	return string(out), err
-}
-
-func parseSaslAuthenticateRequest(payload []byte, apiVersion int16) ([]byte, error) {
-	flexible := apiVersion >= 2
-	r := bytes.NewReader(payload)
-
-	if _, err := r.Seek(8, io.SeekCurrent); err != nil {
-		return nil, err
-	}
-	if err := skipNullableString(r); err != nil { // client_id (still int16-prefixed)
-		return nil, err
-	}
-	if flexible {
-		if err := readTaggedFields(r); err != nil {
-			return nil, err
-		}
-	}
-	if flexible {
-		n, err := binary.ReadUvarint(r)
-		if err != nil {
-			return nil, err
-		}
-		if n == 0 {
-			return nil, errors.New("null auth_bytes")
-		}
-		sz := int(n - 1)
-		return readN(r, sz)
-	}
-	var sz int32
-	if err := binary.Read(r, binary.BigEndian, &sz); err != nil {
-		return nil, err
-	}
-	if sz < 0 {
-		return nil, errors.New("null auth_bytes")
-	}
-	return readN(r, sz)
-}
-
-func buildSaslHandshakeResponse(corrID int32, errorCode int16, mechanisms []string) []byte {
-	var out bytes.Buffer
-	_ = binary.Write(&out, binary.BigEndian, corrID)
-	_ = binary.Write(&out, binary.BigEndian, errorCode)
-	_ = binary.Write(&out, binary.BigEndian, int32(len(mechanisms)))
-	for _, m := range mechanisms {
-		_ = binary.Write(&out, binary.BigEndian, int16(len(m)))
-		out.WriteString(m)
-	}
-	return out.Bytes()
-}
-
-func buildSaslAuthenticateResponse(corrID int32, apiVersion int16, errorCode int16, errorMsg string) []byte {
-	flexible := apiVersion >= 2
-	var out bytes.Buffer
-	_ = binary.Write(&out, binary.BigEndian, corrID)
-	if flexible {
-		out.WriteByte(0) // header tagged_fields (count=0)
-	}
-	_ = binary.Write(&out, binary.BigEndian, errorCode)
-	if flexible {
-		if errorMsg == "" {
-			out.WriteByte(0) // null compact_nullable_string
-		} else {
-			_, _ = writeUvarint(&out, uint64(len(errorMsg)+1))
-			out.WriteString(errorMsg)
-		}
-		out.WriteByte(1) // empty compact_bytes (length 0+1)
-	} else {
-		if errorMsg == "" {
-			_ = binary.Write(&out, binary.BigEndian, int16(-1))
-		} else {
-			_ = binary.Write(&out, binary.BigEndian, int16(len(errorMsg)))
-			out.WriteString(errorMsg)
-		}
-		_ = binary.Write(&out, binary.BigEndian, int32(0)) // empty auth_bytes
-	}
-	if apiVersion >= 1 {
-		_ = binary.Write(&out, binary.BigEndian, int64(0)) // session_lifetime_ms
-	}
-	if flexible {
-		out.WriteByte(0) // body tagged_fields
-	}
-	return out.Bytes()
-}
-
-func skipNullableString(r *bytes.Reader) error {
-	var n int16
-	if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-		return err
-	}
-	if n > 0 {
-		_, err := r.Seek(int64(n), io.SeekCurrent)
-		return err
-	}
-	return nil
-}
-
-func readPacket(ctx context.Context, c net.Conn) ([]byte, error) {
+func readPacket(ctx context.Context, r io.Reader) ([]byte, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 		var size int32
-		if err := binary.Read(c, binary.BigEndian, &size); err != nil {
+		if err := binary.Read(r, binary.BigEndian, &size); err != nil {
 			return nil, err
 		}
 		if size < 0 {
 			return nil, fmt.Errorf("negative size %d", size)
 		}
 		payload := make([]byte, size)
-		if _, err := io.ReadFull(c, payload); err != nil {
+		if _, err := io.ReadFull(r, payload); err != nil {
 			return nil, err
 		}
 		return payload, nil
 	}
 }
 
-func readN[T constraints.Integer](r io.Reader, size T) ([]byte, error) {
-	out := make([]byte, size)
-	if _, err := io.ReadFull(r, out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func writePacket(ctx context.Context, c net.Conn, payload []byte) error {
+func writePacket(ctx context.Context, rw io.Writer, payload []byte) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		var prefix [4]byte
-		binary.BigEndian.PutUint32(prefix[:], uint32(len(payload)))
-		if _, err := c.Write(prefix[:]); err != nil {
+		if err := binary.Write(rw, binary.BigEndian, uint32(len(payload))); err != nil {
 			return err
 		}
-		_, err := c.Write(payload)
+		_, err := rw.Write(payload)
 		return err
 	}
-}
-
-func writeUvarint(out io.Writer, v uint64) (int, error) {
-	var buf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(buf[:], v)
-	return out.Write(buf[:n])
-}
-
-type byteReader struct {
-	io.Reader
-}
-
-func (t *byteReader) ReadByte() (byte, error) {
-	var b [1]byte
-	_, err := io.ReadFull(t.Reader, b[:])
-	return b[0], err
-}
-
-func readTaggedFields(r interface {
-	io.Reader
-	io.ByteReader
-}) error {
-	count, err := binary.ReadUvarint(r)
-	if err != nil {
-		return err
-	}
-	for i := uint64(0); i < count; i++ {
-		_, err := binary.ReadUvarint(r)
-		if err != nil {
-			return err
-		}
-		sz, err := binary.ReadUvarint(r)
-		if err != nil {
-			return err
-		}
-		if _, err := io.ReadAll(io.LimitReader(r, int64(sz))); err != nil {
-			return err
-		}
-	}
-	return nil
 }
