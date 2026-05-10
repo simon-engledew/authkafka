@@ -196,8 +196,8 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 	})
 	defer stopUpstream()
 
-	if err := authenticate(ctx, client, upstream); err != nil {
-		return err
+	if authErr := authenticate(ctx, client, upstream); authErr != nil {
+		return errors.Join(authErr, upstream.Close(), client.Close())
 	}
 
 	log.Printf("%s authenticated, switching to transparent proxy", client.RemoteAddr())
@@ -224,7 +224,7 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 // is rejected — no client requests reach the upstream until auth succeeds.
 func authenticate(ctx context.Context, client, upstream net.Conn) error {
 	for ctx.Err() == nil {
-		payload, err := readPacket(client)
+		payload, err := readPacket(ctx, client)
 		if err != nil {
 			return fmt.Errorf("read client: %w", err)
 		}
@@ -237,10 +237,10 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 
 		switch apiKey {
 		case apiKeyApiVersions:
-			if err := writePacket(upstream, payload); err != nil {
+			if err := writePacket(ctx, upstream, payload); err != nil {
 				return fmt.Errorf("forward ApiVersions: %w", err)
 			}
-			resp, err := readPacket(upstream)
+			resp, err := readPacket(ctx, upstream)
 			if err != nil {
 				return fmt.Errorf("read ApiVersions response: %w", err)
 			}
@@ -252,7 +252,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			}
 			log.Printf("auth ApiVersions rewritten %d -> %d bytes (injected SaslHandshake, SaslAuthenticate)",
 				len(resp), len(rewritten))
-			if err := writePacket(client, rewritten); err != nil {
+			if err := writePacket(ctx, client, rewritten); err != nil {
 				return fmt.Errorf("write ApiVersions response: %w", err)
 			}
 
@@ -267,7 +267,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 				code = errUnsupportedSaslMechanism
 			}
 			resp := buildSaslHandshakeResponse(corrID, code, []string{"PLAIN"})
-			if err := writePacket(client, resp); err != nil {
+			if err := writePacket(ctx, client, resp); err != nil {
 				return fmt.Errorf("write SaslHandshake response: %w", err)
 			}
 			if code != errNoError {
@@ -287,7 +287,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 				msg = "Authentication failed"
 			}
 			resp := buildSaslAuthenticateResponse(corrID, apiVersion, code, msg)
-			if err := writePacket(client, resp); err != nil {
+			if err := writePacket(ctx, client, resp); err != nil {
 				return fmt.Errorf("write SaslAuthenticate response: %w", err)
 			}
 			if !ok {
@@ -297,7 +297,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			return nil
 
 		default:
-			return fmt.Errorf("unexpected api_key %d before SASL authentication", apiKey)
+			return fmt.Errorf("access denied for %d", apiKey)
 		}
 	}
 
@@ -314,7 +314,7 @@ func checkPlainAuth(actual []byte, username, password string) bool {
 
 func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 	for ctx.Err() == nil {
-		payload, err := readPacket(src)
+		payload, err := readPacket(ctx, src)
 		if err != nil {
 			return err
 		}
@@ -332,17 +332,13 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 			}
 
 			if _, allowed := allowedApiKeys[apiKey]; !allowed {
-				if err := writePacket(src, accessDeniedError()); err != nil {
-					return err
-				}
-
-				continue
+				return fmt.Errorf("access denied for %d", apiKey)
 			}
 
 			st.put(corrID, pending{apiKey: apiKey, apiVersion: apiVersion, clientID: clientID})
 		}
 
-		if err := writePacket(dst, payload); err != nil {
+		if err := writePacket(ctx, dst, payload); err != nil {
 			return err
 		}
 	}
@@ -352,7 +348,7 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 
 func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 	for ctx.Err() == nil {
-		payload, err := readPacket(src)
+		payload, err := readPacket(ctx, src)
 		if err != nil {
 			return err
 		}
@@ -366,15 +362,16 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 						return err
 					}
 
-					log.Printf("<< metadata rewritten %d -> %d bytes (addr=%s)",
-						len(payload), len(rewritten), cfg.AdvertiseAddr)
+					if err := writePacket(ctx, dst, rewritten); err != nil {
+						return err
+					}
 
-					payload = rewritten
+					continue
 				}
 			}
 		}
 
-		if err := writePacket(dst, payload); err != nil {
+		if err := writePacket(ctx, dst, payload); err != nil {
 			return err
 		}
 	}
@@ -722,19 +719,24 @@ func skipNullableString(r *bytes.Reader) error {
 	return nil
 }
 
-func readPacket(c net.Conn) ([]byte, error) {
-	var size int32
-	if err := binary.Read(c, binary.BigEndian, &size); err != nil {
-		return nil, err
+func readPacket(ctx context.Context, c net.Conn) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		var size int32
+		if err := binary.Read(c, binary.BigEndian, &size); err != nil {
+			return nil, err
+		}
+		if size < 0 {
+			return nil, fmt.Errorf("negative size %d", size)
+		}
+		payload := make([]byte, size)
+		if _, err := io.ReadFull(c, payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
 	}
-	if size < 0 {
-		return nil, fmt.Errorf("negative size %d", size)
-	}
-	payload := make([]byte, size)
-	if _, err := io.ReadFull(c, payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
 }
 
 func readN[T constraints.Integer](r io.Reader, size T) ([]byte, error) {
@@ -745,14 +747,19 @@ func readN[T constraints.Integer](r io.Reader, size T) ([]byte, error) {
 	return out, nil
 }
 
-func writePacket(c net.Conn, payload []byte) error {
-	var prefix [4]byte
-	binary.BigEndian.PutUint32(prefix[:], uint32(len(payload)))
-	if _, err := c.Write(prefix[:]); err != nil {
+func writePacket(ctx context.Context, c net.Conn, payload []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		var prefix [4]byte
+		binary.BigEndian.PutUint32(prefix[:], uint32(len(payload)))
+		if _, err := c.Write(prefix[:]); err != nil {
+			return err
+		}
+		_, err := c.Write(payload)
 		return err
 	}
-	_, err := c.Write(payload)
-	return err
 }
 
 func writeUvarint(out io.Writer, v uint64) (int, error) {
