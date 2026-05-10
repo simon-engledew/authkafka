@@ -33,6 +33,30 @@ const (
 	errSaslAuthenticationFailed int16 = 58
 )
 
+var allowedApiKeys = map[int16]struct{}{
+	0:  {}, // Produce
+	1:  {}, // Fetch
+	2:  {}, // ListOffsets
+	3:  {}, // Metadata
+	8:  {}, // OffsetCommit
+	9:  {}, // OffsetFetch
+	10: {}, // FindCoordinator
+	11: {}, // JoinGroup
+	12: {}, // Heartbeat
+	13: {}, // LeaveGroup
+	14: {}, // SyncGroup
+	15: {}, // DescribeGroups
+	16: {}, // ListGroups
+	17: {}, // SaslHandshake
+	18: {}, // Versions
+	22: {}, // InitProducerId (idempotent producers)
+	36: {}, // SaslAuthenticate
+	68: {}, // ConsumerGroupHeartbeat (KIP-848)
+	69: {}, // ConsumerGroupDescribe  (KIP-848)
+	71: {}, // GetTelemetrySubscriptions (KIP-714)
+	72: {}, // PushTelemetry            (KIP-714)
+}
+
 type pending struct {
 	apiKey, apiVersion int16
 	clientID           string
@@ -306,6 +330,15 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 					clientID = string(payload[10 : 10+clen])
 				}
 			}
+
+			if _, allowed := allowedApiKeys[apiKey]; !allowed {
+				if err := writePacket(src, accessDeniedError()); err != nil {
+					return err
+				}
+
+				continue
+			}
+
 			st.put(corrID, pending{apiKey: apiKey, apiVersion: apiVersion, clientID: clientID})
 		}
 
@@ -421,6 +454,9 @@ func rewriteApiVersionsResponse(payload []byte, apiVersion int16, inject []apiVe
 			}
 		}
 		if _, drop := dropKey[ak]; drop {
+			continue
+		}
+		if _, allowed := allowedApiKeys[ak]; !allowed {
 			continue
 		}
 		keptCount++
