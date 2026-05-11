@@ -86,7 +86,7 @@ type Addr struct {
 }
 
 func (a Addr) MarshalText() (text []byte, err error) {
-	return []byte(fmt.Sprintf("%s:%d", a.Host, a.Port)), nil
+	return []byte(a.String()), nil
 }
 
 func (a *Addr) UnmarshalText(text []byte) error {
@@ -509,7 +509,9 @@ func writePacket(ctx context.Context, rw io.Writer, payload []byte) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		if err := binary.Write(rw, binary.BigEndian, uint32(len(payload))); err != nil {
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
+		if _, err := rw.Write(size[:]); err != nil {
 			return err
 		}
 		_, err := rw.Write(payload)
