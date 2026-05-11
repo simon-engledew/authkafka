@@ -8,4 +8,4 @@ require (
 	golang.org/x/sync v0.20.0
 )
 
-require github.com/simon-engledew/kafkaproto v0.0.0-20260510214126-c8b37ff022dd // indirect
+require github.com/simon-engledew/kafkaproto v0.0.0-20260511215243-be819fffa06c // indirect

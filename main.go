@@ -58,7 +58,6 @@ var allowedApiKeys = map[int16]struct{}{
 
 type pending struct {
 	apiKey, apiVersion int16
-	clientID           *string
 }
 
 type connState struct {
@@ -66,18 +65,23 @@ type connState struct {
 	pending *lru.Cache[int32, pending]
 }
 
-func (s *connState) put(corrID int32, p pending) {
+func (s *connState) put(corrID int32, apiKey, apiVersion int16) {
 	s.mu.Lock()
-	s.pending.Add(corrID, p)
+	s.pending.Add(corrID, pending{apiKey: apiKey, apiVersion: apiVersion})
 	s.mu.Unlock()
 }
 
-func (s *connState) take(corrID int32) (pending, bool) {
+var errNoCorrelation = errors.New("correlation id not found")
+
+func (s *connState) take(corrID int32) (apiKey, apiVersion int16, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p, ok := s.pending.Get(corrID)
+	if !ok {
+		return apiKey, apiVersion, errNoCorrelation
+	}
 	s.pending.Remove(corrID)
-	return p, ok
+	return p.apiKey, p.apiVersion, nil
 }
 
 type Addr struct {
@@ -121,10 +125,6 @@ var cfg = struct {
 	} `env:", prefix=AUTH_"`
 }{}
 
-func IsErrGoneAway(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
-}
-
 func main() {
 	ctx, cancelFunc := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancelFunc()
@@ -144,7 +144,7 @@ func main() {
 		log.Fatal("both -auth-username and -auth-password are required")
 	}
 
-	if err := listen(ctx); err != nil {
+	if err := listen(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Fatal(err)
 	}
 }
@@ -167,7 +167,7 @@ func listen(ctx context.Context) error {
 			return err
 		}
 		wg.Go(func() error {
-			if err := handle(gCtx, client, cfg.UpstreamAddr); err != nil && !IsErrGoneAway(err) {
+			if err := handle(gCtx, client, cfg.UpstreamAddr); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				log.Print(err)
 			}
 			return nil
@@ -217,21 +217,40 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 	return wg.Wait()
 }
 
-func ReadHeader(r *kafkaproto.Reader) (apiKey int16, apiVersion int16, corrID int32, clientID *string, err error) {
-	apiKey, err = r.ReadInt16()
+func rewriteApiVersions(payload []byte, msg *kafkaproto.ApiVersionsResponse, corrID int32, apiVersion int16) error {
+	r := kafkaproto.NewReader(payload)
+
+	respID, err := r.ReadInt32()
 	if err != nil {
-		return
+		return err
 	}
-	apiVersion, err = r.ReadInt16()
-	if err != nil {
-		return
+	if corrID != respID {
+		return errors.New("incorrect response ID")
 	}
-	corrID, err = r.ReadInt32()
-	if err != nil {
-		return
+
+	if err := msg.Decode(r, apiVersion); err != nil {
+		return err
 	}
-	clientID, err = r.ReadNullableString()
-	return
+
+	apiKeys := make([]kafkaproto.ApiVersionsResponseApiVersion, 0, len(allowedApiKeys))
+
+	for _, k := range msg.ApiKeys {
+		if k.ApiKey == apiKeySaslAuthenticate || k.ApiKey == apiKeySaslHandshake {
+			continue
+		}
+		if _, ok := allowedApiKeys[k.ApiKey]; ok {
+			apiKeys = append(apiKeys, k)
+		}
+	}
+
+	apiKeys = append(apiKeys,
+		kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslHandshake, MinVersion: 1, MaxVersion: 1},
+		kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslAuthenticate, MinVersion: 0, MaxVersion: 2},
+	)
+
+	msg.ApiKeys = apiKeys
+
+	return nil
 }
 
 // authenticate runs the pre-SASL state machine. We only forward ApiVersions
@@ -242,14 +261,14 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 	for ctx.Err() == nil {
 		payload, err := readPacket(ctx, client)
 		if err != nil {
-			return fmt.Errorf("read client: %w", err)
+			return err
 		}
 		if len(payload) < 8 {
 			return errors.New("short request header")
 		}
 
 		r := kafkaproto.NewReader(payload)
-		apiKey, apiVersion, corrID, clientID, err := ReadHeader(r)
+		apiKey, apiVersion, corrID, clientID, err := kafkaproto.ReadRequestHeader(r)
 		if err != nil {
 			return err
 		}
@@ -267,46 +286,18 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 				return err
 			}
 
-			r := kafkaproto.NewReader(resp)
-
-			respID, err := r.ReadInt32()
-			if err != nil {
-				return err
-			}
-			if corrID != respID {
-				return errors.New("incorrect response ID")
-			}
-
 			var msg kafkaproto.ApiVersionsResponse
-			if err := msg.Decode(r, apiVersion); err != nil {
+			if err := rewriteApiVersions(resp, &msg, corrID, apiVersion); err != nil {
 				return err
 			}
-
-			apiKeys := make([]kafkaproto.ApiVersionsResponseApiVersion, 0, len(allowedApiKeys))
-
-			for _, k := range msg.ApiKeys {
-				if k.ApiKey == apiKeySaslAuthenticate || k.ApiKey == apiKeySaslHandshake {
-					continue
-				}
-				if _, ok := allowedApiKeys[k.ApiKey]; ok {
-					apiKeys = append(apiKeys, k)
-				}
-			}
-
-			apiKeys = append(apiKeys,
-				kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslHandshake, MinVersion: 1, MaxVersion: 1},
-				kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslAuthenticate, MinVersion: 0, MaxVersion: 2},
-			)
-
-			msg.ApiKeys = apiKeys
 
 			w := kafkaproto.NewWriter()
-			w.WriteInt32(respID)
+			kafkaproto.WriteResponseHeader(w, corrID, apiKey, apiVersion)
 			if err := msg.Encode(w, apiVersion); err != nil {
 				return err
 			}
 			if err := writePacket(ctx, client, w.Bytes()); err != nil {
-				return fmt.Errorf("write ApiVersions response: %w", err)
+				return err
 			}
 
 		case apiKeySaslHandshake:
@@ -323,7 +314,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			}
 
 			w := kafkaproto.NewWriter()
-			w.WriteInt32(corrID)
+			kafkaproto.WriteResponseHeader(w, corrID, apiKey, apiVersion)
 			if err := resp.Encode(w, apiVersion); err != nil {
 				return err
 			}
@@ -339,12 +330,6 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 		case apiKeySaslAuthenticate:
 			var req kafkaproto.SaslAuthenticateRequest
 
-			if apiVersion >= 2 {
-				if _, err := r.ReadUvarint(); err != nil {
-					return err
-				}
-			}
-
 			if err := req.Decode(r, apiVersion); err != nil {
 				return err
 			}
@@ -355,10 +340,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			ok := checkPlainAuth(req.AuthBytes, cfg.Auth.Username, cfg.Auth.Password)
 
 			w := kafkaproto.NewWriter()
-			w.WriteInt32(corrID)
-			if apiVersion >= 2 {
-				w.WriteUvarint(0)
-			}
+			kafkaproto.WriteResponseHeader(w, corrID, apiKey, apiVersion)
 
 			if !ok {
 				resp.ErrorCode = errSaslAuthenticationFailed
@@ -401,16 +383,18 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 
 		if len(payload) >= 8 {
 			r := kafkaproto.NewReader(payload)
-			apiKey, apiVersion, corrID, clientID, err := ReadHeader(r)
+			apiKey, apiVersion, corrID, clientID, err := kafkaproto.ReadRequestHeader(r)
 			if err != nil {
 				return err
 			}
+
+			_ = clientID
 
 			if _, allowed := allowedApiKeys[apiKey]; !allowed {
 				return fmt.Errorf("access denied for %d", apiKey)
 			}
 
-			st.put(corrID, pending{apiKey: apiKey, apiVersion: apiVersion, clientID: clientID})
+			st.put(corrID, apiKey, apiVersion)
 		}
 
 		if err := writePacket(ctx, dst, payload); err != nil {
@@ -430,49 +414,37 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 
 		if len(payload) >= 4 {
 			r := kafkaproto.NewReader(payload)
-			corrID, err := r.ReadInt32()
+			corrID, apiKey, apiVersion, err := kafkaproto.ReadResponseHeader(r, st.take)
 			if err != nil {
 				return err
 			}
 
-			if p, ok := st.take(corrID); ok {
-				if p.apiKey == apiKeyMetadata {
-					if p.apiVersion >= 9 {
-						if _, err := r.ReadUvarint(); err != nil {
-							return err
-						}
-					}
+			if apiKey == apiKeyMetadata {
+				var resp kafkaproto.MetadataResponse
 
-					var resp kafkaproto.MetadataResponse
-
-					if err := resp.Decode(r, p.apiVersion); err != nil {
-						return err
-					}
-
-					resp.Brokers = resp.Brokers[:1]
-
-					for i := range resp.Brokers {
-						resp.Brokers[i].Host = cfg.AdvertiseAddr.Host
-						resp.Brokers[i].Port = cfg.AdvertiseAddr.Port
-					}
-
-					w := kafkaproto.NewWriter()
-					w.WriteInt32(corrID)
-
-					if p.apiVersion >= 9 {
-						w.WriteUvarint(0)
-					}
-
-					if err := resp.Encode(w, p.apiVersion); err != nil {
-						return err
-					}
-
-					if err := writePacket(ctx, dst, w.Bytes()); err != nil {
-						return err
-					}
-
-					continue
+				if err := resp.Decode(r, apiVersion); err != nil {
+					return err
 				}
+
+				resp.Brokers = resp.Brokers[:1]
+
+				for i := range resp.Brokers {
+					resp.Brokers[i].Host = cfg.AdvertiseAddr.Host
+					resp.Brokers[i].Port = cfg.AdvertiseAddr.Port
+				}
+
+				w := kafkaproto.NewWriter()
+				kafkaproto.WriteResponseHeader(w, corrID, apiKey, apiVersion)
+
+				if err := resp.Encode(w, apiVersion); err != nil {
+					return err
+				}
+
+				if err := writePacket(ctx, dst, w.Bytes()); err != nil {
+					return err
+				}
+
+				continue
 			}
 		}
 
