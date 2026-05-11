@@ -195,8 +195,11 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 	})
 	defer stopUpstream()
 
-	if authErr := authenticate(ctx, client, upstream); authErr != nil {
-		return errors.Join(authErr, upstream.Close(), client.Close())
+	src := &kafkaConn{Conn: client}
+	dst := &kafkaConn{Conn: upstream}
+
+	if authErr := authenticate(ctx, src, dst); authErr != nil {
+		return errors.Join(authErr, src.Close(), dst.Close())
 	}
 
 	log.Printf("%s authenticated, switching to transparent proxy", client.RemoteAddr())
@@ -209,10 +212,10 @@ func handle(ctx context.Context, client net.Conn, upstreamAddr string) (err erro
 	st := &connState{pending: cache}
 	wg, gCtx := errgroup.WithContext(ctx)
 	wg.Go(func() error {
-		return errors.Join(requests(gCtx, client, upstream, st), upstream.Close())
+		return errors.Join(requests(gCtx, src, dst, st), dst.Close())
 	})
 	wg.Go(func() error {
-		return errors.Join(responses(gCtx, upstream, client, st), client.Close())
+		return errors.Join(responses(gCtx, dst, src, st), src.Close())
 	})
 	return wg.Wait()
 }
@@ -257,9 +260,9 @@ func rewriteApiVersions(payload []byte, msg *kafkaproto.ApiVersionsResponse, cor
 // (so the broker can advertise versions); SaslHandshake and SaslAuthenticate
 // are answered locally and the credentials are checked here. Anything else
 // is rejected — no client requests reach the upstream until auth succeeds.
-func authenticate(ctx context.Context, client, upstream net.Conn) error {
+func authenticate(ctx context.Context, src, dst *kafkaConn) error {
 	for ctx.Err() == nil {
-		payload, err := readPacket(ctx, client)
+		payload, err := src.ReadPacket(ctx)
 		if err != nil {
 			return err
 		}
@@ -277,11 +280,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 
 		switch apiKey {
 		case apiKeyApiVersions:
-			if err := writePacket(ctx, upstream, payload); err != nil {
-				return err
-			}
-
-			resp, err := readPacket(ctx, upstream)
+			resp, err := dst.RoundTrip(ctx, payload)
 			if err != nil {
 				return err
 			}
@@ -296,7 +295,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			if err := msg.Encode(w, apiVersion); err != nil {
 				return err
 			}
-			if err := writePacket(ctx, client, w.Bytes()); err != nil {
+			if err := src.WritePacket(ctx, w.Bytes()); err != nil {
 				return err
 			}
 
@@ -319,7 +318,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 				return err
 			}
 
-			if err := writePacket(ctx, client, w.Bytes()); err != nil {
+			if err := src.WritePacket(ctx, w.Bytes()); err != nil {
 				return err
 			}
 
@@ -350,7 +349,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			if err := resp.Encode(w, apiVersion); err != nil {
 				return err
 			}
-			if err := writePacket(ctx, client, w.Bytes()); err != nil {
+			if err := src.WritePacket(ctx, w.Bytes()); err != nil {
 				return err
 			}
 
@@ -360,7 +359,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			log.Printf("auth succeeded for user %q", cfg.Auth.Username)
 			return nil
 		default:
-			return fmt.Errorf("access denied for %d", apiKey)
+			return fmt.Errorf("access denied for %s (%d)", src.RemoteAddr(), apiKey)
 		}
 	}
 
@@ -374,9 +373,9 @@ func checkPlainAuth(actual []byte, username, password string) bool {
 	return subtle.ConstantTimeCompare(actual, expected) == 1
 }
 
-func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
+func requests(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 	for ctx.Err() == nil {
-		payload, err := readPacket(ctx, src)
+		payload, err := src.ReadPacket(ctx)
 		if err != nil {
 			return err
 		}
@@ -391,13 +390,13 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 			_ = clientID
 
 			if _, allowed := allowedApiKeys[apiKey]; !allowed {
-				return fmt.Errorf("access denied for %d", apiKey)
+				return fmt.Errorf("access denied for %s (%d)", src.RemoteAddr(), apiKey)
 			}
 
 			st.put(corrID, apiKey, apiVersion)
 		}
 
-		if err := writePacket(ctx, dst, payload); err != nil {
+		if err := dst.WritePacket(ctx, payload); err != nil {
 			return err
 		}
 	}
@@ -405,9 +404,9 @@ func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
 	return ctx.Err()
 }
 
-func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
+func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 	for ctx.Err() == nil {
-		payload, err := readPacket(ctx, src)
+		payload, err := src.ReadPacket(ctx)
 		if err != nil {
 			return err
 		}
@@ -440,7 +439,7 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 					return err
 				}
 
-				if err := writePacket(ctx, dst, w.Bytes()); err != nil {
+				if err := dst.WritePacket(ctx, w.Bytes()); err != nil {
 					return err
 				}
 
@@ -448,7 +447,7 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 			}
 		}
 
-		if err := writePacket(ctx, dst, payload); err != nil {
+		if err := dst.WritePacket(ctx, payload); err != nil {
 			return err
 		}
 	}
@@ -456,37 +455,49 @@ func responses(ctx context.Context, src, dst net.Conn, st *connState) error {
 	return ctx.Err()
 }
 
-func readPacket(ctx context.Context, r io.Reader) ([]byte, error) {
+type kafkaConn struct {
+	net.Conn
+}
+
+func (c *kafkaConn) ReadPacket(ctx context.Context) ([]byte, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 		var size int32
-		if err := binary.Read(r, binary.BigEndian, &size); err != nil {
+		if err := binary.Read(c.Conn, binary.BigEndian, &size); err != nil {
 			return nil, err
 		}
 		if size < 0 {
 			return nil, fmt.Errorf("negative size %d", size)
 		}
 		payload := make([]byte, size)
-		if _, err := io.ReadFull(r, payload); err != nil {
+		if _, err := io.ReadFull(c.Conn, payload); err != nil {
 			return nil, err
 		}
 		return payload, nil
 	}
 }
 
-func writePacket(ctx context.Context, rw io.Writer, payload []byte) error {
+func (c *kafkaConn) WritePacket(ctx context.Context, payload []byte) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 		var size [4]byte
 		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
-		if _, err := rw.Write(size[:]); err != nil {
+		if _, err := c.Conn.Write(size[:]); err != nil {
 			return err
 		}
-		_, err := rw.Write(payload)
+		_, err := c.Conn.Write(payload)
 		return err
 	}
+}
+
+func (c *kafkaConn) RoundTrip(ctx context.Context, payload []byte) ([]byte, error) {
+	err := c.WritePacket(ctx, payload)
+	if err != nil {
+		return nil, err
+	}
+	return c.ReadPacket(ctx)
 }
