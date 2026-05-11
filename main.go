@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/binary"
@@ -351,7 +350,7 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			}
 			var resp kafkaproto.SaslAuthenticateResponse
 
-			resp.AuthBytes = req.AuthBytes
+			resp.AuthBytes = []byte{}
 
 			ok := checkPlainAuth(req.AuthBytes, cfg.Auth.Username, cfg.Auth.Password)
 
@@ -389,9 +388,8 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 // checkPlainAuth parses RFC 4616 PLAIN auth bytes ("[authzid]\0authcid\0passwd")
 // and constant-time-compares against the configured credentials.
 func checkPlainAuth(actual []byte, username, password string) bool {
-	idx := bytes.IndexByte(actual, byte(0))
-	expected := []byte(username + "\x00" + password)
-	return subtle.ConstantTimeCompare(actual[idx+1:], expected) == 1
+	expected := []byte("\x00" + username + "\x00" + password)
+	return subtle.ConstantTimeCompare(actual, expected) == 1
 }
 
 func requests(ctx context.Context, src, dst net.Conn, st *connState) error {
