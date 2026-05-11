@@ -13,6 +13,7 @@ import (
 	"net"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -316,7 +317,9 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			}
 			var resp kafkaproto.SaslHandshakeResponse
 
-			if req.Mechanism != "PLAIN" {
+			resp.Mechanisms = []string{"PLAIN"}
+
+			if !strings.EqualFold(req.Mechanism, "PLAIN") {
 				resp.ErrorCode = errUnsupportedSaslMechanism
 			}
 
