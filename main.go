@@ -351,6 +351,8 @@ func authenticate(ctx context.Context, client, upstream net.Conn) error {
 			}
 			var resp kafkaproto.SaslAuthenticateResponse
 
+			resp.AuthBytes = req.AuthBytes
+
 			ok := checkPlainAuth(req.AuthBytes, cfg.Auth.Username, cfg.Auth.Password)
 
 			w := kafkaproto.NewWriter()
