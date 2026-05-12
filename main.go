@@ -32,30 +32,6 @@ const (
 	errSaslAuthenticationFailed int16 = 58
 )
 
-var allowedApiKeys = map[int16]struct{}{
-	0:  {}, // Produce
-	1:  {}, // Fetch
-	2:  {}, // ListOffsets
-	3:  {}, // Metadata
-	8:  {}, // OffsetCommit
-	9:  {}, // OffsetFetch
-	10: {}, // FindCoordinator
-	11: {}, // JoinGroup
-	12: {}, // Heartbeat
-	13: {}, // LeaveGroup
-	14: {}, // SyncGroup
-	15: {}, // DescribeGroups
-	16: {}, // ListGroups
-	17: {}, // SaslHandshake
-	18: {}, // Versions
-	22: {}, // InitProducerId (idempotent producers)
-	36: {}, // SaslAuthenticate
-	68: {}, // ConsumerGroupHeartbeat (KIP-848)
-	69: {}, // ConsumerGroupDescribe  (KIP-848)
-	71: {}, // GetTelemetrySubscriptions (KIP-714)
-	72: {}, // PushTelemetry            (KIP-714)
-}
-
 type pending struct {
 	apiKey, apiVersion int16
 }
@@ -119,11 +95,43 @@ var cfg = struct {
 	Listen        string `env:"LISTEN,overwrite"`
 	UpstreamAddr  string `env:"UPSTREAM,overwrite"`
 	AdvertiseAddr Addr   `env:"ADVERTISE,overwrite"`
+	Admin         bool   `env:"ADMIN,overwrite"`
 	Auth          struct {
 		Username string `env:"USERNAME,overwrite"`
 		Password string `env:"PASSWORD,overwrite"`
 	} `env:", prefix=AUTH_"`
 }{}
+
+func isAllowed(apiKey int16) bool {
+	if cfg.Admin {
+		return true
+	}
+	switch apiKey {
+	case 0, // Produce
+		1,  // Fetch
+		2,  // ListOffsets
+		3,  // Metadata
+		8,  // OffsetCommit
+		9,  // OffsetFetch
+		10, // FindCoordinator
+		11, // JoinGroup
+		12, // Heartbeat
+		13, // LeaveGroup
+		14, // SyncGroup
+		15, // DescribeGroups
+		16, // ListGroups
+		18, // Versions
+		22, // InitProducerId (idempotent producers)
+		68, // ConsumerGroupHeartbeat (KIP-848)
+		69, // ConsumerGroupDescribe  (KIP-848)
+		71, // GetTelemetrySubscriptions (KIP-714)
+		72, // PushTelemetry            (KIP-714)
+		apiKeySaslAuthenticate,
+		apiKeySaslHandshake:
+		return true
+	}
+	return false
+}
 
 func main() {
 	ctx, cancelFunc := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -134,6 +142,7 @@ func main() {
 	flag.TextVar(&cfg.AdvertiseAddr, "advertise", Addr{Host: "127.0.0.1", Port: 9093}, "host:port to advertise to clients in Metadata responses")
 	flag.StringVar(&cfg.Auth.Username, "auth-username", "", "required SASL/PLAIN username")
 	flag.StringVar(&cfg.Auth.Password, "auth-password", "", "required SASL/PLAIN password")
+	flag.BoolVar(&cfg.Admin, "admin", false, "allow access to admin features")
 	flag.Parse()
 
 	if err := envconfig.Process(ctx, &cfg); err != nil {
@@ -235,13 +244,18 @@ func rewriteApiVersions(payload []byte, msg *kafkaproto.ApiVersionsResponse, cor
 		return err
 	}
 
-	apiKeys := make([]kafkaproto.ApiVersionsResponseApiVersion, 0, len(allowedApiKeys))
+	size := 21
+	if cfg.Admin {
+		size = len(msg.ApiKeys)
+	}
+
+	apiKeys := make([]kafkaproto.ApiVersionsResponseApiVersion, 0, size+2)
 
 	for _, k := range msg.ApiKeys {
 		if k.ApiKey == apiKeySaslAuthenticate || k.ApiKey == apiKeySaslHandshake {
 			continue
 		}
-		if _, ok := allowedApiKeys[k.ApiKey]; ok {
+		if isAllowed(k.ApiKey) {
 			apiKeys = append(apiKeys, k)
 		}
 	}
@@ -262,15 +276,16 @@ func rewriteApiVersions(payload []byte, msg *kafkaproto.ApiVersionsResponse, cor
 // is rejected — no client requests reach the upstream until auth succeeds.
 func authenticate(ctx context.Context, src, dst *kafkaConn) error {
 	for ctx.Err() == nil {
-		payload, err := src.ReadPacket(ctx)
+		buf, err := src.ReadPacket(ctx)
 		if err != nil {
 			return err
 		}
-		if len(payload) < 8 {
+
+		if len(buf) < 8 {
 			return errors.New("short request header")
 		}
 
-		r := kafkaproto.NewReader(payload)
+		r := kafkaproto.NewReader(buf)
 		apiKey, apiVersion, corrID, clientID, err := kafkaproto.ReadRequestHeader(r)
 		if err != nil {
 			return err
@@ -280,13 +295,16 @@ func authenticate(ctx context.Context, src, dst *kafkaConn) error {
 
 		switch apiKey {
 		case apiKeyApiVersions:
-			resp, err := dst.RoundTrip(ctx, payload)
+			if err := dst.WritePacket(ctx, buf); err != nil {
+				return err
+			}
+			buf, err := dst.ReadPacket(ctx)
 			if err != nil {
 				return err
 			}
 
 			var msg kafkaproto.ApiVersionsResponse
-			if err := rewriteApiVersions(resp, &msg, corrID, apiVersion); err != nil {
+			if err := rewriteApiVersions(buf, &msg, corrID, apiVersion); err != nil {
 				return err
 			}
 
@@ -375,13 +393,13 @@ func checkPlainAuth(actual []byte, username, password string) bool {
 
 func requests(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 	for ctx.Err() == nil {
-		payload, err := src.ReadPacket(ctx)
+		buf, err := src.ReadPacket(ctx)
 		if err != nil {
 			return err
 		}
 
-		if len(payload) >= 8 {
-			r := kafkaproto.NewReader(payload)
+		if len(buf) >= 8 {
+			r := kafkaproto.NewReader(buf)
 			apiKey, apiVersion, corrID, clientID, err := kafkaproto.ReadRequestHeader(r)
 			if err != nil {
 				return err
@@ -389,14 +407,14 @@ func requests(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 
 			_ = clientID
 
-			if _, allowed := allowedApiKeys[apiKey]; !allowed {
+			if !isAllowed(apiKey) {
 				return fmt.Errorf("access denied for %s (%d)", src.RemoteAddr(), apiKey)
 			}
 
 			st.put(corrID, apiKey, apiVersion)
 		}
 
-		if err := dst.WritePacket(ctx, payload); err != nil {
+		if err := dst.WritePacket(ctx, buf); err != nil {
 			return err
 		}
 	}
@@ -406,13 +424,13 @@ func requests(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 
 func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 	for ctx.Err() == nil {
-		payload, err := src.ReadPacket(ctx)
+		buf, err := src.ReadPacket(ctx)
 		if err != nil {
 			return err
 		}
 
-		if len(payload) >= 4 {
-			r := kafkaproto.NewReader(payload)
+		if len(buf) >= 4 {
+			r := kafkaproto.NewReader(buf)
 			corrID, apiKey, apiVersion, err := kafkaproto.ReadResponseHeader(r, st.take)
 			if err != nil {
 				return err
@@ -447,7 +465,7 @@ func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 			}
 		}
 
-		if err := dst.WritePacket(ctx, payload); err != nil {
+		if err := dst.WritePacket(ctx, buf); err != nil {
 			return err
 		}
 	}
@@ -457,6 +475,7 @@ func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 
 type kafkaConn struct {
 	net.Conn
+	buf [256]byte
 }
 
 func (c *kafkaConn) ReadPacket(ctx context.Context) ([]byte, error) {
@@ -464,18 +483,21 @@ func (c *kafkaConn) ReadPacket(ctx context.Context) ([]byte, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
-		var size int32
-		if err := binary.Read(c.Conn, binary.BigEndian, &size); err != nil {
+		var tmp [4]byte
+		if _, err := io.ReadFull(c.Conn, tmp[:]); err != nil {
 			return nil, err
 		}
-		if size < 0 {
-			return nil, fmt.Errorf("negative size %d", size)
+		size := int(binary.BigEndian.Uint32(tmp[:]))
+		var buf []byte
+		if size > 256 {
+			buf = make([]byte, size)
+		} else {
+			buf = c.buf[:size]
 		}
-		payload := make([]byte, size)
-		if _, err := io.ReadFull(c.Conn, payload); err != nil {
+		if _, err := io.ReadFull(c.Conn, buf); err != nil {
 			return nil, err
 		}
-		return payload, nil
+		return buf, nil
 	}
 }
 
@@ -484,20 +506,12 @@ func (c *kafkaConn) WritePacket(ctx context.Context, payload []byte) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		var size [4]byte
-		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
-		if _, err := c.Conn.Write(size[:]); err != nil {
+		var tmp [4]byte
+		binary.BigEndian.PutUint32(tmp[:], uint32(len(payload)))
+		if _, err := c.Conn.Write(tmp[:]); err != nil {
 			return err
 		}
 		_, err := c.Conn.Write(payload)
 		return err
 	}
-}
-
-func (c *kafkaConn) RoundTrip(ctx context.Context, payload []byte) ([]byte, error) {
-	err := c.WritePacket(ctx, payload)
-	if err != nil {
-		return nil, err
-	}
-	return c.ReadPacket(ctx)
 }
