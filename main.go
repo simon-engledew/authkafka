@@ -261,7 +261,7 @@ func rewriteApiVersions(payload []byte, msg *kafkaproto.ApiVersionsResponse, cor
 	}
 
 	apiKeys = append(apiKeys,
-		kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslHandshake, MinVersion: 1, MaxVersion: 1},
+		kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslHandshake, MinVersion: 0, MaxVersion: 1},
 		kafkaproto.ApiVersionsResponseApiVersion{ApiKey: apiKeySaslAuthenticate, MinVersion: 0, MaxVersion: 2},
 	)
 
