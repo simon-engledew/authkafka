@@ -358,7 +358,7 @@ func authenticate(ctx context.Context, src, dst *kafkaConn) (string, error) {
 			resp.AuthBytes = []byte{}
 
 			auth := cfg.Auth
-			if usernameFromAuthBytes(req.AuthBytes) == cfg.Admin.Username {
+			if cfg.Admin.Username != "" && cfg.Admin.Password != "" && usernameFromAuthBytes(req.AuthBytes) == cfg.Admin.Username {
 				auth = cfg.Admin
 			}
 
