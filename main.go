@@ -134,6 +134,7 @@ func (c *connState) isAllowed(apiKey int16) bool {
 		69, // ConsumerGroupDescribe  (KIP-848)
 		71, // GetTelemetrySubscriptions (KIP-714)
 		72, // PushTelemetry            (KIP-714)
+		75, // DescribeTopicPartitions
 		apiKeySaslAuthenticate,
 		apiKeySaslHandshake:
 		return true
@@ -316,6 +317,7 @@ func authenticate(ctx context.Context, src, dst *kafkaConn) (string, error) {
 			if err := msg.Encode(w, apiVersion); err != nil {
 				return "", err
 			}
+
 			if err := src.WritePacket(ctx, w.Bytes()); err != nil {
 				return "", err
 			}
