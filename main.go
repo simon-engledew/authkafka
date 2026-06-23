@@ -515,30 +515,6 @@ func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 				}
 				continue
 
-			case apiKeyFetch:
-				var resp kafkaproto.FetchResponse
-				if err := resp.Decode(r, apiVersion); err != nil {
-					return err
-				}
-
-				// NodeEndpoints (KIP-951) is populated only on leadership
-				// errors, but when present it carries the real broker host:port.
-				// Leave the common empty case as a pass-through so we never
-				// re-encode record batches on the hot path.
-				if len(resp.NodeEndpoints) == 0 {
-					break
-				}
-				for i := range resp.NodeEndpoints {
-					resp.NodeEndpoints[i].Host = cfg.AdvertiseAddr.Host
-					resp.NodeEndpoints[i].Port = cfg.AdvertiseAddr.Port
-					resp.NodeEndpoints[i].Rack = nil
-				}
-
-				if err := writeResponse(ctx, dst, corrID, apiKey, apiVersion, &resp); err != nil {
-					return err
-				}
-				continue
-
 			case apiKeyFindCoordinator:
 				var resp kafkaproto.FindCoordinatorResponse
 				if err := resp.Decode(r, apiVersion); err != nil {
