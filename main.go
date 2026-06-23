@@ -24,6 +24,7 @@ import (
 )
 
 const (
+	apiKeyFetch            = 1
 	apiKeyMetadata         = 3
 	apiKeyFindCoordinator  = 10
 	apiKeySaslHandshake    = 17
@@ -502,10 +503,35 @@ func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 
 				if len(resp.Brokers) > 1 {
 					resp.Brokers = resp.Brokers[:1]
-					for i := range resp.Brokers {
-						resp.Brokers[i].Host = cfg.AdvertiseAddr.Host
-						resp.Brokers[i].Port = cfg.AdvertiseAddr.Port
-					}
+				}
+				for i := range resp.Brokers {
+					resp.Brokers[i].Host = cfg.AdvertiseAddr.Host
+					resp.Brokers[i].Port = cfg.AdvertiseAddr.Port
+					resp.Brokers[i].Rack = nil
+				}
+
+				if err := writeResponse(ctx, dst, corrID, apiKey, apiVersion, &resp); err != nil {
+					return err
+				}
+				continue
+
+			case apiKeyFetch:
+				var resp kafkaproto.FetchResponse
+				if err := resp.Decode(r, apiVersion); err != nil {
+					return err
+				}
+
+				// NodeEndpoints (KIP-951) is populated only on leadership
+				// errors, but when present it carries the real broker host:port.
+				// Leave the common empty case as a pass-through so we never
+				// re-encode record batches on the hot path.
+				if len(resp.NodeEndpoints) == 0 {
+					break
+				}
+				for i := range resp.NodeEndpoints {
+					resp.NodeEndpoints[i].Host = cfg.AdvertiseAddr.Host
+					resp.NodeEndpoints[i].Port = cfg.AdvertiseAddr.Port
+					resp.NodeEndpoints[i].Rack = nil
 				}
 
 				if err := writeResponse(ctx, dst, corrID, apiKey, apiVersion, &resp); err != nil {
@@ -522,6 +548,9 @@ func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 				// v0-v3 carry a single top-level coordinator; v4+ a list.
 				resp.Host = cfg.AdvertiseAddr.Host
 				resp.Port = cfg.AdvertiseAddr.Port
+				if len(resp.Coordinators) > 1 {
+					resp.Coordinators = resp.Coordinators[:1]
+				}
 				for i := range resp.Coordinators {
 					resp.Coordinators[i].Host = cfg.AdvertiseAddr.Host
 					resp.Coordinators[i].Port = cfg.AdvertiseAddr.Port
@@ -544,6 +573,7 @@ func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 				for i := range resp.Brokers {
 					resp.Brokers[i].Host = cfg.AdvertiseAddr.Host
 					resp.Brokers[i].Port = cfg.AdvertiseAddr.Port
+					resp.Brokers[i].Rack = nil
 				}
 
 				if err := writeResponse(ctx, dst, corrID, apiKey, apiVersion, &resp); err != nil {
