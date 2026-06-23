@@ -25,9 +25,11 @@ import (
 
 const (
 	apiKeyMetadata         = 3
+	apiKeyFindCoordinator  = 10
 	apiKeySaslHandshake    = 17
 	apiKeyApiVersions      = 18
 	apiKeySaslAuthenticate = 36
+	apiKeyDescribeCluster  = 60
 
 	errTopicAuthorizationFailed int16 = 29
 	errUnsupportedSaslMechanism int16 = 33
@@ -462,6 +464,18 @@ func requests(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 	return ctx.Err()
 }
 
+// writeResponse encodes msg with the given response header and forwards it.
+func writeResponse(ctx context.Context, dst *kafkaConn, corrID int32, apiKey, apiVersion int16, msg interface {
+	Encode(*kafkaproto.Writer, int16) error
+}) error {
+	w := kafkaproto.NewWriter()
+	kafkaproto.WriteResponseHeader(w, corrID, apiKey, apiVersion)
+	if err := msg.Encode(w, apiVersion); err != nil {
+		return err
+	}
+	return dst.WritePacket(ctx, w.Bytes())
+}
+
 func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 	for ctx.Err() == nil {
 		buf, err := src.ReadPacket(ctx)
@@ -476,31 +490,65 @@ func responses(ctx context.Context, src, dst *kafkaConn, st *connState) error {
 				return err
 			}
 
-			if apiKey == apiKeyMetadata {
+			// Several APIs hand back a broker's real host:port. Metadata is
+			// the obvious one, but FindCoordinator and DescribeCluster leak it
+			// too, so rewrite all of them to advertise only AdvertiseAddr.
+			switch apiKey {
+			case apiKeyMetadata:
 				var resp kafkaproto.MetadataResponse
-
 				if err := resp.Decode(r, apiVersion); err != nil {
 					return err
 				}
 
-				resp.Brokers = resp.Brokers[:1]
+				if len(resp.Brokers) > 1 {
+					resp.Brokers = resp.Brokers[:1]
+					for i := range resp.Brokers {
+						resp.Brokers[i].Host = cfg.AdvertiseAddr.Host
+						resp.Brokers[i].Port = cfg.AdvertiseAddr.Port
+					}
+				}
 
+				if err := writeResponse(ctx, dst, corrID, apiKey, apiVersion, &resp); err != nil {
+					return err
+				}
+				continue
+
+			case apiKeyFindCoordinator:
+				var resp kafkaproto.FindCoordinatorResponse
+				if err := resp.Decode(r, apiVersion); err != nil {
+					return err
+				}
+
+				// v0-v3 carry a single top-level coordinator; v4+ a list.
+				resp.Host = cfg.AdvertiseAddr.Host
+				resp.Port = cfg.AdvertiseAddr.Port
+				for i := range resp.Coordinators {
+					resp.Coordinators[i].Host = cfg.AdvertiseAddr.Host
+					resp.Coordinators[i].Port = cfg.AdvertiseAddr.Port
+				}
+
+				if err := writeResponse(ctx, dst, corrID, apiKey, apiVersion, &resp); err != nil {
+					return err
+				}
+				continue
+
+			case apiKeyDescribeCluster:
+				var resp kafkaproto.DescribeClusterResponse
+				if err := resp.Decode(r, apiVersion); err != nil {
+					return err
+				}
+
+				if len(resp.Brokers) > 1 {
+					resp.Brokers = resp.Brokers[:1]
+				}
 				for i := range resp.Brokers {
 					resp.Brokers[i].Host = cfg.AdvertiseAddr.Host
 					resp.Brokers[i].Port = cfg.AdvertiseAddr.Port
 				}
 
-				w := kafkaproto.NewWriter()
-				kafkaproto.WriteResponseHeader(w, corrID, apiKey, apiVersion)
-
-				if err := resp.Encode(w, apiVersion); err != nil {
+				if err := writeResponse(ctx, dst, corrID, apiKey, apiVersion, &resp); err != nil {
 					return err
 				}
-
-				if err := dst.WritePacket(ctx, w.Bytes()); err != nil {
-					return err
-				}
-
 				continue
 			}
 		}
